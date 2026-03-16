@@ -1,0 +1,7 @@
+services:
+  - type: worker          # background worker — no HTTP port needed
+    name: telegram-2in1-bot
+    env: docker           # ← tells Render to use your Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false       # set this manually in the Render dashboard
