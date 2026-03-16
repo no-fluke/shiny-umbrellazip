@@ -1,7 +1,9 @@
 services:
-  - type: worker          # background worker — no HTTP port needed
+  - type: web             # ← web service (exposes HTTP port)
     name: telegram-2in1-bot
-    env: docker           # ← tells Render to use your Dockerfile
+    env: docker
     envVars:
       - key: BOT_TOKEN
-        sync: false       # set this manually in the Render dashboard
+        sync: false       # set manually in Render dashboard
+      - key: WEBHOOK_URL
+        sync: false       # set to your Render URL, e.g. https://telegram-2in1-bot.onrender.com
