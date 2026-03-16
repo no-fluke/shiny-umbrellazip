@@ -17,7 +17,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN",   "YOUR_BOT_TOKEN_HERE")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")   # e.g. https://your-app.onrender.com
+PORT        = int(os.environ.get("PORT", 8080))    # Render injects $PORT automatically
 
 # user_sessions[user_id] = {
 #   "mode": "text" | "zip",
@@ -305,8 +307,20 @@ def main():
         )
     )
 
-    logger.info("✅ Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if WEBHOOK_URL:
+        # ── Webhook mode (production on Render) ───────────────────────────
+        logger.info(f"✅ Bot starting in WEBHOOK mode on port {PORT}...")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=f"{WEBHOOK_URL}/telegram",
+            url_path="telegram",
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        # ── Polling mode (local development) ──────────────────────────────
+        logger.info("✅ Bot starting in POLLING mode (local dev)...")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
