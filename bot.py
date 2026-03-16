@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import zipfile
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -18,32 +19,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN   = os.environ.get("BOT_TOKEN",   "YOUR_BOT_TOKEN_HERE")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")   # e.g. https://your-app.onrender.com
-PORT        = int(os.environ.get("PORT", 8080))    # Render injects $PORT automatically
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+PORT        = int(os.environ.get("PORT", 8080))
 
 # user_sessions[user_id] = {
-#   "mode": "text" | "zip",
-#   "texts": [...],
-#   "files": [{"name": ..., "data": bytes}],
+#   "mode":        "text" | "zip",
+#   "step":        "naming" | "collecting",
+#   "output_name": str,          # custom filename WITHOUT extension
+#   "texts":       [...],        # text mode only
+#   "files":       [{"name": str, "data": bytes}],  # zip mode only
 # }
 user_sessions = {}
+
+SAFE_NAME = re.compile(r"[^\w\-. ]")
+
+
+def sanitise(name: str) -> str:
+    name = SAFE_NAME.sub("_", name.strip())
+    name = name.strip(". ")
+    return name if name else None
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_sessions.pop(user_id, None)
-
-    keyboard = [
-        [
-            InlineKeyboardButton("📝  Text → TXT File", callback_data="mode_text"),
-            InlineKeyboardButton("🗜️  ZIP Maker",        callback_data="mode_zip"),
-        ]
-    ]
+    user_sessions.pop(update.effective_user.id, None)
+    keyboard = [[
+        InlineKeyboardButton("📝  Text → TXT File", callback_data="mode_text"),
+        InlineKeyboardButton("🗜️  ZIP Maker",        callback_data="mode_zip"),
+    ]]
     await update.message.reply_text(
-        "👋 *Welcome to the 2-in-1 Bot!*\n\n"
-        "Please choose a mode to get started:",
+        "👋 *Welcome to the 2-in-1 Bot!*\n\nPlease choose a mode to get started:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -57,20 +63,22 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if query.data == "mode_text":
-        user_sessions[user_id] = {"mode": "text", "texts": []}
+        user_sessions[user_id] = {"mode": "text", "step": "naming", "output_name": "", "texts": []}
         await query.edit_message_text(
             "📝 *Text → TXT File Mode*\n\n"
-            "Send me your text messages one by one.\n"
-            "When you're done, send /done and I'll package everything into a `.txt` file!",
+            "What would you like to name your output file?\n"
+            "_(No extension needed — e.g.* `my_notes` *or* `meeting recap`_)\n\n"
+            "Send /skip to use the default: `output.txt`",
             parse_mode="Markdown",
         )
 
     elif query.data == "mode_zip":
-        user_sessions[user_id] = {"mode": "zip", "files": []}
+        user_sessions[user_id] = {"mode": "zip", "step": "naming", "output_name": "", "files": []}
         await query.edit_message_text(
             "🗜️ *ZIP Maker Mode*\n\n"
-            "Send me the files you want to zip (documents, photos, audio, video, etc.).\n"
-            "When you're done, send /done and I'll bundle them into a `.zip` archive!",
+            "What would you like to name your ZIP archive?\n"
+            "_(No extension needed — e.g.* `project_files` *or* `photos jan`_)\n\n"
+            "Send /skip to use the default: `archive.zip`",
             parse_mode="Markdown",
         )
 
@@ -81,18 +89,31 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_sessions.pop(query.from_user.id, None)
-
-    keyboard = [
-        [
-            InlineKeyboardButton("📝  Text → TXT File", callback_data="mode_text"),
-            InlineKeyboardButton("🗜️  ZIP Maker",        callback_data="mode_zip"),
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton("📝  Text → TXT File", callback_data="mode_text"),
+        InlineKeyboardButton("🗜️  ZIP Maker",        callback_data="mode_zip"),
+    ]]
     await query.edit_message_text(
         "👋 *Welcome back!*\n\nChoose a mode to get started:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
+
+
+# ── /skip ─────────────────────────────────────────────────────────────────────
+
+async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    session = user_sessions.get(user_id)
+
+    if not session or session.get("step") != "naming":
+        await update.message.reply_text("⚠️ Nothing to skip right now.")
+        return
+
+    default = "output" if session["mode"] == "text" else "archive"
+    session["output_name"] = default
+    session["step"] = "collecting"
+    await _collecting_prompt(update, session)
 
 
 # ── /done ─────────────────────────────────────────────────────────────────────
@@ -102,56 +123,53 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = user_sessions.get(user_id)
 
     if not session:
+        await update.message.reply_text("⚠️ No active session. Send /start to begin!")
+        return
+
+    if session.get("step") == "naming":
         await update.message.reply_text(
-            "⚠️ No active session. Send /start to begin!"
+            "⚠️ Please send a filename first, or use /skip to use the default."
         )
         return
 
-    mode = session["mode"]
+    mode     = session["mode"]
+    out_base = session.get("output_name") or ("output" if mode == "text" else "archive")
 
     if mode == "text":
         texts = session.get("texts", [])
         if not texts:
-            await update.message.reply_text(
-                "⚠️ You haven't sent any text yet! Send some messages first, then /done."
-            )
+            await update.message.reply_text("⚠️ No messages yet! Send some text first.")
             return
 
-        combined = "\n\n".join(texts)
-        buf = io.BytesIO(combined.encode("utf-8"))
-        buf.name = "output.txt"
-
+        filename = f"{out_base}.txt"
+        buf      = io.BytesIO("\n\n".join(texts).encode("utf-8"))
+        buf.name = filename
         await update.message.reply_document(
-            document=buf,
-            filename="output.txt",
-            caption=f"✅ Here's your TXT file containing *{len(texts)} message(s)*!",
+            document=buf, filename=filename,
+            caption=f"✅ Here's *{filename}* — {len(texts)} message(s) inside!",
             parse_mode="Markdown",
         )
 
     elif mode == "zip":
         files = session.get("files", [])
         if not files:
-            await update.message.reply_text(
-                "⚠️ You haven't sent any files yet! Send some files first, then /done."
-            )
+            await update.message.reply_text("⚠️ No files yet! Send some files first.")
             return
 
-        zip_buf = io.BytesIO()
+        filename = f"{out_base}.zip"
+        zip_buf  = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for f in files:
                 zf.writestr(f["name"], f["data"])
         zip_buf.seek(0)
-        zip_buf.name = "archive.zip"
-
+        zip_buf.name = filename
         await update.message.reply_document(
-            document=zip_buf,
-            filename="archive.zip",
-            caption=f"✅ Here's your ZIP archive containing *{len(files)} file(s)*!",
+            document=zip_buf, filename=filename,
+            caption=f"✅ Here's *{filename}* — {len(files)} file(s) inside!",
             parse_mode="Markdown",
         )
 
     user_sessions.pop(user_id, None)
-
     keyboard = [[InlineKeyboardButton("🔄 Start Again", callback_data="restart")]]
     await update.message.reply_text(
         "Want to do something else?",
@@ -169,6 +187,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please send /start first to choose a mode.")
         return
 
+    # Naming step: user provides custom filename
+    if session["step"] == "naming":
+        clean = sanitise(update.message.text)
+        if not clean:
+            await update.message.reply_text(
+                "⚠️ That name doesn't look valid. Try again or send /skip."
+            )
+            return
+        session["output_name"] = clean
+        session["step"]        = "collecting"
+        await _collecting_prompt(update, session)
+        return
+
+    # Collecting step
     if session["mode"] != "text":
         await update.message.reply_text(
             "⚠️ You're in *ZIP Maker* mode — please send files, not text.\n"
@@ -195,6 +227,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please send /start first to choose a mode.")
         return
 
+    if session["step"] == "naming":
+        await update.message.reply_text(
+            "⚠️ Please send a filename first (or /skip to use the default)."
+        )
+        return
+
     if session["mode"] != "zip":
         await update.message.reply_text(
             "⚠️ You're in *Text → TXT* mode — please send text, not files.\n"
@@ -204,39 +242,38 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = update.message
-
     if msg.document:
-        tg_file = await msg.document.get_file()
+        tg_file  = await msg.document.get_file()
         filename = msg.document.file_name or f"file_{len(session['files']) + 1}"
     elif msg.photo:
-        tg_file = await msg.photo[-1].get_file()
+        tg_file  = await msg.photo[-1].get_file()
         filename = f"photo_{len(session['files']) + 1}.jpg"
     elif msg.audio:
-        tg_file = await msg.audio.get_file()
+        tg_file  = await msg.audio.get_file()
         filename = msg.audio.file_name or f"audio_{len(session['files']) + 1}.mp3"
     elif msg.video:
-        tg_file = await msg.video.get_file()
+        tg_file  = await msg.video.get_file()
         filename = msg.video.file_name or f"video_{len(session['files']) + 1}.mp4"
     elif msg.voice:
-        tg_file = await msg.voice.get_file()
+        tg_file  = await msg.voice.get_file()
         filename = f"voice_{len(session['files']) + 1}.ogg"
     elif msg.sticker:
-        tg_file = await msg.sticker.get_file()
+        tg_file  = await msg.sticker.get_file()
         filename = f"sticker_{len(session['files']) + 1}.webp"
     else:
         await update.message.reply_text("⚠️ Unsupported file type.")
         return
 
-    # Deduplicate filename inside zip
-    existing = [f["name"] for f in session["files"]]
+    # Deduplicate filename inside the zip
+    existing  = [f["name"] for f in session["files"]]
     base_name = filename
-    counter = 1
+    counter   = 1
     while filename in existing:
         if "." in base_name:
             name, ext = base_name.rsplit(".", 1)
-            filename = f"{name}_{counter}.{ext}"
+            filename  = f"{name}_{counter}.{ext}"
         else:
-            filename = f"{base_name}_{counter}"
+            filename  = f"{base_name}_{counter}"
         counter += 1
 
     buf = io.BytesIO()
@@ -269,12 +306,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *2-in-1 Bot Help*\n\n"
         "*Commands:*\n"
         "• /start  — Choose a mode\n"
+        "• /skip   — Use default output filename\n"
         "• /done   — Process & receive your file\n"
         "• /cancel — Cancel current session\n"
         "• /help   — Show this message\n\n"
         "*Modes:*\n"
-        "📝 *Text → TXT* — Collect text messages → get a `.txt` file\n"
-        "🗜️ *ZIP Maker*   — Collect files → get a `.zip` archive",
+        "📝 *Text → TXT* — Collect messages → get a named `.txt` file\n"
+        "🗜️ *ZIP Maker*   — Collect files    → get a named `.zip` archive",
+        parse_mode="Markdown",
+    )
+
+
+# ── Shared helper ─────────────────────────────────────────────────────────────
+
+async def _collecting_prompt(update, session):
+    name = session["output_name"]
+    ext  = "txt" if session["mode"] == "text" else "zip"
+    if session["mode"] == "text":
+        body = "Now send me your text messages one by one.\nType /done when finished."
+    else:
+        body = "Now send me the files you want to zip.\nType /done when finished."
+    await update.message.reply_text(
+        f"✅ Output will be named *{name}.{ext}*\n\n{body}",
         parse_mode="Markdown",
     )
 
@@ -285,6 +338,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",  start))
+    app.add_handler(CommandHandler("skip",   skip))
     app.add_handler(CommandHandler("done",   done))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("help",   help_command))
@@ -308,7 +362,6 @@ def main():
     )
 
     if WEBHOOK_URL:
-        # ── Webhook mode (production on Render) ───────────────────────────
         logger.info(f"✅ Bot starting in WEBHOOK mode on port {PORT}...")
         app.run_webhook(
             listen="0.0.0.0",
@@ -318,7 +371,6 @@ def main():
             allowed_updates=Update.ALL_TYPES,
         )
     else:
-        # ── Polling mode (local development) ──────────────────────────────
         logger.info("✅ Bot starting in POLLING mode (local dev)...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
