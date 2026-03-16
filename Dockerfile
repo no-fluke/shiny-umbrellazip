@@ -11,5 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ── Copy bot source ───────────────────────────────────────────────────────────
 COPY bot.py .
 
+# ── Expose the port Render will bind to ──────────────────────────────────────
+EXPOSE 8080
+
 # ── Run the bot ───────────────────────────────────────────────────────────────
 CMD ["python", "bot.py"]
