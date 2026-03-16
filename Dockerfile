@@ -1,18 +1,14 @@
-# ── Base image ────────────────────────────────────────────────────────────────
 FROM python:3.12-slim
 
-# ── Set working directory ─────────────────────────────────────────────────────
 WORKDIR /app
 
-# ── Install dependencies first (layer-cache friendly) ─────────────────────────
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Copy bot source ───────────────────────────────────────────────────────────
+# Force no cache so the correct package is always installed
+RUN pip install --no-cache-dir "python-telegram-bot[webhooks]==21.6"
+
 COPY bot.py .
 
-# ── Expose the port Render will bind to ──────────────────────────────────────
 EXPOSE 8080
 
-# ── Run the bot ───────────────────────────────────────────────────────────────
 CMD ["python", "bot.py"]
