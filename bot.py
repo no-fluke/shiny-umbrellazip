@@ -18,12 +18,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., "https://yourdomain.com"
+PORT = int(os.environ.get("PORT", 8443))
 
 # user_sessions[user_id] = {
 #   "mode": "text" | "zip",
 #   "texts": [...],
 #   "files": [{"name": ..., "data": bytes}],
-#   "awaiting_filename": bool,   # True if we asked for a custom name after /done
+#   "awaiting_filename": bool,
 # }
 user_sessions = {}
 
@@ -141,7 +143,6 @@ async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Generate file with default name
     await generate_and_send_file(update, context, custom_name=None)
-    # Clear session (already done inside generate_and_send_file)
 
 
 # ── Helper to generate and send the final file ─────────────────────────────────
@@ -375,8 +376,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Add handlers
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("done",    done))
     app.add_handler(CommandHandler("skip",    skip))
@@ -401,8 +404,19 @@ def main():
         )
     )
 
-    logger.info("✅ Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Start webhook
+    if WEBHOOK_URL:
+        logger.info(f"Starting webhook on port {PORT} with URL {WEBHOOK_URL}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+        )
+    else:
+        # Fallback to polling if WEBHOOK_URL is not set (for local testing)
+        logger.warning("WEBHOOK_URL not set, falling back to polling.")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
