@@ -3,6 +3,7 @@ import io
 import re
 import zipfile
 import logging
+import traceback
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -59,45 +60,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer()          # always answer immediately to unfreeze the button
     user_id = query.from_user.id
 
-    if query.data == "mode_text":
-        user_sessions[user_id] = {"mode": "text", "step": "naming", "output_name": "", "texts": []}
-        await query.edit_message_text(
-            "📝 *Text → TXT File Mode*\n\n"
-            "What would you like to name your output file?\n"
-            "_(No extension needed — e.g.* `my_notes` *or* `meeting recap`_)\n\n"
-            "Send /skip to use the default: `output.txt`",
-            parse_mode="Markdown",
-        )
+    try:
+        if query.data == "mode_text":
+            user_sessions[user_id] = {"mode": "text", "step": "naming", "output_name": "", "texts": []}
+            await query.edit_message_text(
+                "📝 *Text → TXT File Mode*\n\n"
+                "What would you like to name your output file?\n"
+                "_(No extension needed — e.g.* `my_notes` *or* `meeting recap`_)\n\n"
+                "Send /skip to use the default: `output.txt`",
+                parse_mode="Markdown",
+            )
 
-    elif query.data == "mode_zip":
-        user_sessions[user_id] = {"mode": "zip", "step": "naming", "output_name": "", "files": []}
-        await query.edit_message_text(
-            "🗜️ *ZIP Maker Mode*\n\n"
-            "What would you like to name your ZIP archive?\n"
-            "_(No extension needed — e.g.* `project_files` *or* `photos jan`_)\n\n"
-            "Send /skip to use the default: `archive.zip`",
-            parse_mode="Markdown",
-        )
+        elif query.data == "mode_zip":
+            user_sessions[user_id] = {"mode": "zip", "step": "naming", "output_name": "", "files": []}
+            await query.edit_message_text(
+                "🗜️ *ZIP Maker Mode*\n\n"
+                "What would you like to name your ZIP archive?\n"
+                "_(No extension needed — e.g.* `project_files` *or* `photos jan`_)\n\n"
+                "Send /skip to use the default: `archive.zip`",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error(f"mode_callback error: {e}\n{traceback.format_exc()}")
+        await query.message.reply_text("⚠️ Something went wrong. Please send /start and try again.")
 
 
 # ── Restart callback ──────────────────────────────────────────────────────────
 
 async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer()          # always answer immediately to unfreeze the button
     user_sessions.pop(query.from_user.id, None)
-    keyboard = [[
-        InlineKeyboardButton("📝  Text → TXT File", callback_data="mode_text"),
-        InlineKeyboardButton("🗜️  ZIP Maker",        callback_data="mode_zip"),
-    ]]
-    await query.edit_message_text(
-        "👋 *Welcome back!*\n\nChoose a mode to get started:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
+
+    try:
+        keyboard = [[
+            InlineKeyboardButton("📝  Text → TXT File", callback_data="mode_text"),
+            InlineKeyboardButton("🗜️  ZIP Maker",        callback_data="mode_zip"),
+        ]]
+        await query.edit_message_text(
+            "👋 *Welcome back!*\n\nChoose a mode to get started:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"restart_callback error: {e}\n{traceback.format_exc()}")
+        await query.message.reply_text("⚠️ Something went wrong. Please send /start and try again.")
 
 
 # ── /skip ─────────────────────────────────────────────────────────────────────
@@ -332,6 +342,16 @@ async def _collecting_prompt(update, session):
     )
 
 
+# ── Global error handler ─────────────────────────────────────────────────────
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Unhandled exception: {context.error}\n{traceback.format_exc()}")
+    if isinstance(update, Update):
+        target = update.effective_message
+        if target:
+            await target.reply_text("⚠️ An unexpected error occurred. Please send /start to begin again.")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -360,6 +380,8 @@ def main():
             handle_file,
         )
     )
+
+    app.add_error_handler(error_handler)
 
     if WEBHOOK_URL:
         logger.info(f"✅ Bot starting in WEBHOOK mode on port {PORT}...")
