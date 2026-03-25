@@ -2,6 +2,7 @@ import os
 import io
 import zipfile
 import logging
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -22,7 +23,7 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., "https://yourdomain.com"
 PORT = int(os.environ.get("PORT", 8443))
 
 # user_sessions[user_id] = {
-#   "mode": "text" | "zip",
+#   "mode": "text" | "zip" | "convert",
 #   "texts": [...],
 #   "files": [{"name": ..., "data": bytes}],
 #   "awaiting_filename": bool,
@@ -40,6 +41,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("📝  Text → TXT File", callback_data="mode_text"),
             InlineKeyboardButton("🗜️  ZIP Maker",        callback_data="mode_zip"),
+            InlineKeyboardButton("📄  Convert to GS Format", callback_data="mode_convert"),
         ]
     ]
     await update.message.reply_text(
@@ -75,6 +77,17 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
+    elif query.data == "mode_convert":
+        user_sessions[user_id] = {"mode": "convert"}
+        await query.edit_message_text(
+            "📄 *Convert to GS Format Mode*\n\n"
+            "Send me a `.txt` file containing questions in the **annotated format** "
+            "(with Q.No:, options, Correct option:, and Explanation).\n\n"
+            "I will restructure it into the GS format (like `Chslgs3(4).txt`), "
+            "filling in the correct option and explanation automatically.",
+            parse_mode="Markdown",
+        )
+
 
 # ── Restart callback ──────────────────────────────────────────────────────────
 
@@ -87,6 +100,7 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("📝  Text → TXT File", callback_data="mode_text"),
             InlineKeyboardButton("🗜️  ZIP Maker",        callback_data="mode_zip"),
+            InlineKeyboardButton("📄  Convert to GS Format", callback_data="mode_convert"),
         ]
     ]
     await query.edit_message_text(
@@ -118,6 +132,12 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif mode == "zip" and not session.get("files"):
         await update.message.reply_text(
             "⚠️ You haven't sent any files yet! Send some files first, then /done."
+        )
+        return
+    elif mode == "convert":
+        await update.message.reply_text(
+            "⚠️ In Convert mode, the file is processed as soon as you upload it.\n"
+            "You don't need to use /done here."
         )
         return
 
@@ -163,7 +183,6 @@ async def generate_and_send_file(update: Update, context: ContextTypes.DEFAULT_T
 
             # Determine filename
             if custom_name:
-                # Sanitize and add .txt if needed
                 custom_name = os.path.basename(custom_name).strip(". ")
                 if not custom_name:
                     custom_name = "output"
@@ -208,6 +227,8 @@ async def generate_and_send_file(update: Update, context: ContextTypes.DEFAULT_T
                 caption=f"✅ Here's your ZIP archive containing *{len(files)} file(s)*!",
                 parse_mode="Markdown",
             )
+
+        # Convert mode does not go through this function
     except Exception as e:
         logger.error(f"Error generating file: {e}")
         await update.message.reply_text("❌ An error occurred while creating your file.")
@@ -222,6 +243,134 @@ async def generate_and_send_file(update: Update, context: ContextTypes.DEFAULT_T
         "Want to do something else?",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+# ── New conversion function for annotated format ───────────────────────────────
+
+def convert_annotated_to_gs(text: str) -> str:
+    """
+    Convert a text file containing questions with Q.No:, options, Correct option:, and Explanation
+    into the GS format with filled-in correct option and explanation.
+    """
+    lines = text.splitlines()
+    output_blocks = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i].strip()
+        # Detect start of a question: "Q.No:" possibly surrounded by ** or other markdown
+        if re.match(r'\**Q\.No\s*:\s*\d+\**', line, re.IGNORECASE):
+            # Extract question number
+            match_num = re.search(r'Q\.No\s*:\s*(\d+)', line, re.IGNORECASE)
+            if not match_num:
+                i += 1
+                continue
+            q_num = match_num.group(1)
+
+            # Skip the Q.No line
+            i += 1
+
+            # Collect question text (may span several lines until we hit an option line or "Correct option:")
+            question_lines = []
+            while i < n:
+                line = lines[i].strip()
+                # Stop if we hit an option line (A., B., etc.) or the correct option header
+                if (re.match(r'^[A-D][\.\)]', line, re.IGNORECASE) or
+                    re.match(r'\**Correct option:', line, re.IGNORECASE)):
+                    break
+                # Also stop if we hit another Q.No (in case of missing blank lines)
+                if re.match(r'\**Q\.No\s*:', line, re.IGNORECASE):
+                    break
+                # Collect non-empty lines, but ignore empty lines that separate content
+                if line:
+                    question_lines.append(line)
+                i += 1
+
+            question_text = " ".join(question_lines).strip()
+
+            # Collect options (A, B, C, D)
+            options = {}
+            # We'll look for lines starting with A., B., C., D. (case-insensitive)
+            # We'll collect them in the order they appear, but store in dict
+            # We'll also handle cases where the option text continues on the next line (e.g., after a line break)
+            # For simplicity, assume each option is on its own line (the input format usually is like that)
+            while i < n:
+                line = lines[i].strip()
+                match_opt = re.match(r'^([A-D])[\.\)]\s*(.*)', line, re.IGNORECASE)
+                if not match_opt:
+                    break
+                opt_letter = match_opt.group(1).upper()
+                opt_text = match_opt.group(2).strip()
+                options[opt_letter] = opt_text
+                i += 1
+
+            # Now we expect a line with "Correct option:" (maybe with **)
+            correct_option_letter = None
+            while i < n:
+                line = lines[i].strip()
+                if re.match(r'\**Correct option:', line, re.IGNORECASE):
+                    # Extract the option letter (e.g., "B", "B.", "B. were going on")
+                    # We'll take the first capital letter after the colon, ignoring spaces and punctuation
+                    after_colon = re.sub(r'^.*?:', '', line, flags=re.IGNORECASE).strip()
+                    # Find first letter that is A, B, C, D (case-insensitive)
+                    match_letter = re.search(r'([A-D])', after_colon, re.IGNORECASE)
+                    if match_letter:
+                        correct_option_letter = match_letter.group(1).lower()
+                    i += 1
+                    break
+                i += 1
+
+            # If we didn't find a correct option, set to empty string
+            if not correct_option_letter:
+                correct_option_letter = ""
+
+            # Now we expect the explanation header: "Explanation (in depth and detailed):"
+            explanation_lines = []
+            while i < n:
+                line = lines[i].strip()
+                if re.match(r'\**Explanation\s*\(.*\)\s*:', line, re.IGNORECASE):
+                    # This line may contain the start of the explanation after the colon
+                    # Extract text after colon if any
+                    after_colon = re.sub(r'^.*?:', '', line, flags=re.IGNORECASE).strip()
+                    if after_colon:
+                        explanation_lines.append(after_colon)
+                    i += 1
+                    # Now collect all subsequent lines until we hit the next question or end of file
+                    while i < n:
+                        next_line = lines[i].strip()
+                        # Stop if we encounter a new Q.No line
+                        if re.match(r'\**Q\.No\s*:', next_line, re.IGNORECASE):
+                            break
+                        # Also stop if we encounter a new Correct option (should not happen, but just in case)
+                        if re.match(r'\**Correct option:', next_line, re.IGNORECASE):
+                            break
+                        # Collect explanation text, even if empty lines (they will be collapsed)
+                        explanation_lines.append(next_line)
+                        i += 1
+                    break
+                i += 1
+
+            # Combine explanation lines into a single string, removing excessive whitespace
+            explanation = " ".join(explanation_lines).strip()
+
+            # Build the output block for this question
+            block = f"{q_num}. {question_text}\n"
+            block += "    \n"  # blank Hindi question
+            for opt in ["A", "B", "C", "D"]:
+                opt_en = options.get(opt, "")
+                block += f"    {opt.lower()}) {opt_en}\n"
+                block += "        \n"  # blank Hindi option
+            block += f"Correct option:-{correct_option_letter}\n"
+            block += f"ex: {explanation}\n"
+            block += "\n"  # blank line between questions
+
+            output_blocks.append(block)
+
+        else:
+            i += 1
+
+    return "\n".join(output_blocks).strip()
 
 
 # ── Incoming text messages ────────────────────────────────────────────────────
@@ -256,7 +405,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Normal text collection
     if session["mode"] != "text":
         await update.message.reply_text(
-            "⚠️ You're in *ZIP Maker* mode — please send files, not text.\n"
+            "⚠️ You're in a mode that expects files or conversion.\n"
             "Use /start to switch modes.",
             parse_mode="Markdown",
         )
@@ -288,14 +437,74 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if session["mode"] != "zip":
+    mode = session["mode"]
+
+    if mode == "convert":
+        # Process the uploaded file as a conversion job
+        msg = update.message
+        # Only accept documents (text files) for conversion
+        if not msg.document:
+            await update.message.reply_text(
+                "⚠️ Please send a `.txt` document for conversion. Other file types are not supported in this mode."
+            )
+            return
+
+        # Download the file
+        file = await msg.document.get_file()
+        file_bytes = io.BytesIO()
+        await file.download_to_memory(file_bytes)
+        file_bytes.seek(0)
+        content = file_bytes.read().decode("utf-8", errors="replace")
+
+        try:
+            converted = convert_annotated_to_gs(content)
+        except Exception as e:
+            logger.error(f"Conversion error: {e}")
+            await update.message.reply_text(
+                "❌ Failed to convert the file. Please ensure it follows the expected annotated format "
+                "(Q.No:, options, Correct option:, Explanation)."
+            )
+            return
+
+        # Prepare output buffer
+        output_buf = io.BytesIO()
+        output_buf.write(converted.encode("utf-8"))
+        output_buf.seek(0)
+
+        # Determine output filename
+        original_name = msg.document.file_name or "converted"
+        base, ext = os.path.splitext(original_name)
+        if ext.lower() != ".txt":
+            output_filename = f"{base}_converted.txt"
+        else:
+            output_filename = f"{base}_converted{ext}"
+
+        output_buf.name = output_filename
+
+        await update.message.reply_document(
+            document=output_buf,
+            filename=output_filename,
+            caption="✅ Conversion complete! Here's your file in GS format with filled-in correct options and explanations.",
+        )
+
+        # Clear session and offer restart
+        user_sessions.pop(user_id, None)
+        keyboard = [[InlineKeyboardButton("🔄 Start Again", callback_data="restart")]]
         await update.message.reply_text(
-            "⚠️ You're in *Text → TXT* mode — please send text, not files.\n"
-            "Use /start to switch modes.",
+            "Want to do something else?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if mode != "zip":
+        await update.message.reply_text(
+            "⚠️ You're in a mode that does not accept files.\n"
+            "Use /start to switch to ZIP Maker or Convert mode.",
             parse_mode="Markdown",
         )
         return
 
+    # ZIP Maker mode: collect files
     msg = update.message
 
     if msg.document:
@@ -362,13 +571,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *2-in-1 Bot Help*\n\n"
         "*Commands:*\n"
         "• /start  — Choose a mode\n"
-        "• /done   — Finish and choose a custom filename\n"
-        "• /skip   — Skip custom naming and use default name\n"
+        "• /done   — Finish and choose a custom filename (text/zip modes)\n"
+        "• /skip   — Skip custom naming and use default name (text/zip modes)\n"
         "• /cancel — Cancel current session\n"
         "• /help   — Show this message\n\n"
         "*Modes:*\n"
         "📝 *Text → TXT* — Collect text messages → get a `.txt` file\n"
-        "🗜️ *ZIP Maker*   — Collect files → get a `.zip` archive",
+        "🗜️ *ZIP Maker*   — Collect files → get a `.zip` archive\n"
+        "📄 *Convert to GS Format* — Upload a `.txt` file with questions, options, correct answer, and explanation → get a properly formatted GS file",
         parse_mode="Markdown",
     )
 
@@ -376,10 +586,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Add handlers
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("done",    done))
     app.add_handler(CommandHandler("skip",    skip))
@@ -404,7 +612,6 @@ def main():
         )
     )
 
-    # Start webhook
     if WEBHOOK_URL:
         logger.info(f"Starting webhook on port {PORT} with URL {WEBHOOK_URL}")
         app.run_webhook(
@@ -414,7 +621,6 @@ def main():
             webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
         )
     else:
-        # Fallback to polling if WEBHOOK_URL is not set (for local testing)
         logger.warning("WEBHOOK_URL not set, falling back to polling.")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
